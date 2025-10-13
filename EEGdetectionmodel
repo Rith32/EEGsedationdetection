@@ -1,0 +1,716 @@
+import os
+import mne
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
+from sklearn.metrics import classification_report, mean_squared_error, accuracy_score
+from sklearn.cluster import KMeans
+from sklearn.preprocessing import StandardScaler
+import joblib
+import tkinter as tk
+from tkinter import filedialog
+import h5py
+from scipy.signal import welch
+from scipy import io
+import matplotlib.pyplot as plt
+
+# Frequency bands
+BANDS = {
+    'delta': (0.5, 4),
+    'theta': (4, 8),
+    'alpha': (8, 13),
+    'beta': (13, 30)
+}
+
+def select_data_folder():
+    
+    root = tk.Tk()
+    root.withdraw()
+    
+    folder_path = filedialog.askdirectory(
+        title="Select folder containing your .set files"
+    )
+    
+    if not folder_path:
+        print("No folder selected. Exiting.")
+        return None
+    
+    print(f"Selected folder: {folder_path}")
+    return folder_path
+
+def extract_band_power(psds, freqs, band):
+    fmin, fmax = BANDS[band]
+    idx = np.logical_and(freqs >= fmin, freqs < fmax)
+    return psds[:, idx].mean(axis=1)
+
+def read_eeg_data(file_path):
+    """
+    Try to read EEG data using MNE. If it fails due to HDF5, use h5py.
+    Returns: data (channels x samples), sfreq (sampling frequency)
+    """
+    try:
+        # First try to read as epochs (for epoched data)
+        try:
+            epochs = mne.io.read_epochs_eeglab(file_path)
+            # Concatenate all epochs into one continuous signal
+            data = epochs.get_data()  # shape: (n_epochs, n_channels, n_times)
+            data = data.transpose(1, 0, 2)  # shape: (n_channels, n_epochs, n_times)
+            data = data.reshape(data.shape[0], -1)  # shape: (n_channels, n_total_samples)
+            sfreq = epochs.info['sfreq']
+            return data, sfreq
+        except Exception as epoch_error:
+            # If epochs reading fails, try raw data
+            raw = mne.io.read_raw_eeglab(file_path, preload=True)
+            data = raw.get_data()
+            sfreq = raw.info['sfreq']
+            return data, sfreq
+    except Exception as e:
+        if "Please use HDF reader for matlab v7.3 files" in str(e):
+            print(f"Falling back to h5py for {file_path} (MATLAB v7.3 format)...")
+            with h5py.File(file_path, 'r') as f:
+                # Try to extract data and sampling rate
+                # Common structure: /data, /srate
+                if 'data' in f and 'srate' in f:
+                    data = np.array(f['data'])
+                    sfreq = float(np.array(f['srate']))
+                    # EEGLAB stores as (channels, samples)
+                    return data, sfreq
+                else:
+                    raise RuntimeError("Could not find 'data' and 'srate' in HDF5 .set file.")
+        else:
+            raise
+
+def compute_band_features(data, sfreq):
+    """
+    Compute mean and std power for each band for the given EEG data.
+    """
+    features = {}
+    # Welch's method for PSD
+    freqs, psd = welch(data, fs=sfreq, nperseg=2048, axis=1)
+    for band in BANDS:
+        fmin, fmax = BANDS[band]
+        idx = np.logical_and(freqs >= fmin, freqs < fmax)
+        band_power = psd[:, idx].mean(axis=1)
+        features[f'{band}_mean'] = band_power.mean()
+        features[f'{band}_std'] = band_power.std()
+    return features
+
+def read_datainfo(data_dir):
+    """Read datainfo.mat and extract sedation levels and propofol concentrations"""
+    datainfo_path = os.path.join(data_dir, 'datainfo.mat')
+    if not os.path.exists(datainfo_path):
+        print(f"datainfo.mat not found in {data_dir}")
+        return None
+    
+    try:
+        # Load the MATLAB file
+        mat_data = io.loadmat(datainfo_path)
+        print("Successfully loaded datainfo.mat")
+        
+        # Print available keys to understand the structure
+        print("Available keys in datainfo.mat:", list(mat_data.keys()))
+        
+        # Look for the data structure (usually 'dc' or similar)
+        for key in mat_data.keys():
+            if not key.startswith('__'):  # Skip metadata keys
+                print(f"Key '{key}' has type: {type(mat_data[key])}")
+                if hasattr(mat_data[key], 'dtype'):
+                    print(f"  Shape: {mat_data[key].shape}, dtype: {mat_data[key].dtype}")
+        
+        return mat_data
+    except Exception as e:
+        print(f"Error reading datainfo.mat: {e}")
+        return None
+
+def create_labels_from_datainfo(data_dir, set_files):
+    """Create labels.csv from datainfo.mat information"""
+    mat_data = read_datainfo(data_dir)
+    if mat_data is None:
+        return False
+    
+    print("\nAttempting to extract labels from datainfo.mat...")
+    
+    # Try to find the data structure
+    # Look for common patterns in the data
+    labels_data = []
+    
+    for key in mat_data.keys():
+        if not key.startswith('__'):
+            data = mat_data[key]
+            print(f"Examining key '{key}':")
+            print(f"  Type: {type(data)}")
+            if hasattr(data, 'shape'):
+                print(f"  Shape: {data.shape}")
+                if hasattr(data, 'dtype'):
+                    print(f"  dtype: {data.dtype}")
+            
+            # If it's a structured array, try to extract information
+            if hasattr(data, 'dtype') and data.dtype.names:
+                print(f"  Structured array with fields: {data.dtype.names}")
+                for i, field in enumerate(data.dtype.names):
+                    if hasattr(data, field):
+                        field_data = getattr(data, field)
+                        print(f"    {field}: {field_data}")
+                        
+                        # Try to extract dataset names and sedation levels
+                        if field in ['description', 'desc', 'name', 'dataset']:
+                            print(f"      Dataset names found: {field_data}")
+                        elif field in ['sedation', 'level', 'sedation_level']:
+                            print(f"      Sedation levels found: {field_data}")
+                        elif field in ['propofol', 'concentration', 'propofol_conc']:
+                            print(f"      Propofol concentrations found: {field_data}")
+    
+    # For now, create a template and ask user to manually map
+    print("\nCould not automatically extract data from datainfo.mat")
+    print("Creating a template labels.csv for manual entry...")
+    
+    # Create a template with the set files
+    labels_path = os.path.join(data_dir, 'labels.csv')
+    label_template = pd.DataFrame({
+        'file': set_files, 
+        'sedation_level': [''] * len(set_files),
+        'propofol_concentration': [''] * len(set_files),
+        'label': [''] * len(set_files)
+    })
+    label_template.to_csv(labels_path, index=False)
+    print(f"Template created at {labels_path}")
+    print("Please fill in the columns:")
+    print("- sedation_level: 1=baseline, 2=mild, 3=moderate, 4=recovery")
+    print("- propofol_concentration: in microgram/litre")
+    print("- label: use sedation_level (1-4) or propofol_concentration for regression")
+    
+    return True
+
+def create_sliding_windows(data, sfreq, window_duration=30, overlap=0.5):
+    """
+    Create sliding windows from EEG data.
+    
+    Parameters:
+    - data: EEG data (channels x samples)
+    - sfreq: Sampling frequency
+    - window_duration: Window duration in seconds (default: 30s)
+    - overlap: Overlap between windows (0.0 to 1.0, default: 0.5 = 50% overlap)
+    
+    Returns:
+    - windows: List of window data
+    - window_times: Start times of each window
+    """
+    window_samples = int(window_duration * sfreq)
+    step_samples = int(window_samples * (1 - overlap))
+    
+    windows = []
+    window_times = []
+    
+    for start_sample in range(0, data.shape[1] - window_samples + 1, step_samples):
+        window_data = data[:, start_sample:start_sample + window_samples]
+        windows.append(window_data)
+        window_times.append(start_sample / sfreq)  # Start time in seconds
+    
+    return windows, window_times
+
+def extract_window_features(data_dir, window_duration=30, overlap=0.5):
+    """
+    Extract features from sliding windows for all files.
+    """
+    results = []
+    set_files = []
+    
+    for fname in os.listdir(data_dir):
+        if fname.endswith('.set'):
+            set_files.append(fname)
+            file_path = os.path.join(data_dir, fname)
+            print(f"Processing {fname} with sliding windows...")
+            
+            try:
+                data, sfreq = read_eeg_data(file_path)
+                windows, window_times = create_sliding_windows(data, sfreq, window_duration, overlap)
+                
+                print(f"  Created {len(windows)} windows")
+                
+                for i, (window_data, start_time) in enumerate(zip(windows, window_times)):
+                    features = compute_band_features(window_data, sfreq)
+                    features['file'] = fname
+                    features['window_id'] = i
+                    features['start_time'] = start_time
+                    results.append(features)
+                    
+            except Exception as e:
+                print(f"Error processing {fname}: {e}")
+                import traceback
+                traceback.print_exc()
+    
+    return results, set_files
+
+def train_model(data_dir):
+    results = []
+    set_files = []
+    
+    # Debug: Show what files are in the directory
+    all_files = os.listdir(data_dir)
+    set_files_found = [f for f in all_files if f.endswith('.set')]
+    print(f"Found {len(set_files_found)} .set files in directory: {data_dir}")
+    print(f"All files in directory: {all_files[:10]}...")  # Show first 10 files
+    
+    for fname in os.listdir(data_dir):
+        if fname.endswith('.set'):
+            set_files.append(fname)
+            file_path = os.path.join(data_dir, fname)
+            print(f"Processing {fname}...")
+            try:
+                data, sfreq = read_eeg_data(file_path)
+                print(f"  Successfully loaded data: shape={data.shape}, sfreq={sfreq}")
+                features = compute_band_features(data, sfreq)
+                features['file'] = fname
+                results.append(features)
+                print(f"  Successfully extracted features for {fname}")
+            except Exception as e:
+                print(f"Error processing {fname}: {e}")
+                import traceback
+                traceback.print_exc()
+
+    if not results:
+        print("No features were successfully extracted from any files!")
+        print("This means all .set files failed to load. Check the error messages above.")
+        return
+
+    df = pd.DataFrame(results)
+    print(f"Successfully extracted features from {len(df)} files")
+    df.to_csv('eeg_band_features.csv', index=False)
+    print("Feature extraction complete. Results saved to eeg_band_features.csv.")
+
+    # 2. Try to load labels
+    labels_path = os.path.join(data_dir, 'labels.csv')
+    newlabels_path = os.path.join(data_dir, 'newlabels.csv')
+    
+    if not os.path.exists(labels_path):
+        if os.path.exists(newlabels_path):
+            print(f"Found newlabels.csv, renaming to labels.csv...")
+            import shutil
+            shutil.move(newlabels_path, labels_path)
+            print("File renamed successfully!")
+        else:
+            print("\nNo labels.csv found. Trying to read datainfo.mat...")
+            if create_labels_from_datainfo(data_dir, set_files):
+                print("Successfully created labels.csv from datainfo.mat")
+            else:
+                print("\nCreating a template labels.csv for you to fill in...")
+                label_template = pd.DataFrame({'file': set_files, 'label': [''] * len(set_files)})
+                label_template.to_csv(labels_path, index=False)
+                print("A template labels.csv has been created. Please open it and fill in the 'label' column with your drowsiness/sedation levels or propofol doses for each file.")
+                print("After saving your labels, run this script again to train the model.")
+                return
+
+    labels_df = pd.read_csv(labels_path)
+    
+    # Debug: Print column names
+    print(f"Features DataFrame columns: {list(df.columns)}")
+    print(f"Labels DataFrame columns: {list(labels_df.columns)}")
+    
+    # Check if 'file' column exists in labels_df
+    if 'file' not in labels_df.columns:
+        print("Error: 'file' column not found in labels.csv")
+        print("Available columns in labels.csv:", list(labels_df.columns))
+        print("Please ensure your labels.csv has a 'file' column with the .set filenames.")
+        return
+    
+    # Check for matching files
+    df_files = set(df['file'])
+    labels_files = set(labels_df['file'])
+    matching_files = df_files.intersection(labels_files)
+    
+    print(f"Files with features: {len(df_files)}")
+    print(f"Files with labels: {len(labels_files)}")
+    print(f"Matching files: {len(matching_files)}")
+    
+    if len(matching_files) == 0:
+        print("Error: No matching files between features and labels.")
+        print("Sample files with features:", list(df_files)[:5])
+        print("Sample files with labels:", list(labels_files)[:5])
+        return
+    
+    df = df.merge(labels_df, on='file', how='inner')
+    print(f"Loaded {len(df)} samples with labels.")
+
+    # Debug: Show labels data
+    print("\nLabels data:")
+    print(df[['file', 'label']].head(10))
+    print(f"Label data types: {df['label'].dtype}")
+    print(f"Label unique values: {df['label'].unique()}")
+    print(f"Label has NaN: {df['label'].isna().any()}")
+
+    # 3. Prepare data for model
+    X = df[[f'{band}_mean' for band in BANDS] + [f'{band}_std' for band in BANDS]].values
+    y = df['label'].values
+
+    # Handle NaN values in labels
+    if np.isnan(y).any():
+        print("Warning: Found NaN values in labels. Removing rows with NaN labels.")
+        valid_indices = ~np.isnan(y)
+        X = X[valid_indices]
+        y = y[valid_indices]
+        print(f"After removing NaN labels: {len(y)} samples remaining")
+        
+        if len(y) == 0:
+            print("\nERROR: No valid labels found!")
+            print("All labels in your labels.csv file are empty or NaN.")
+            print("\nTo fix this:")
+            print("1. Open the labels.csv file in your data folder")
+            print("2. Fill in the 'label' column with sedation levels (1-4) or propofol concentrations")
+            print("3. Save the file and run this script again")
+            print("\nExample labels:")
+            print("- For classification: 1=baseline, 2=mild, 3=moderate, 4=recovery")
+            print("- For regression: propofol concentration in microgram/litre")
+            return
+
+    # 4. Determine if classification or regression
+    is_classification = False
+    try:
+        y_int = y.astype(int)
+        if np.allclose(y, y_int):
+            y = y_int
+            is_classification = True
+    except:
+        pass
+
+    # 5. Train/test split
+    X_train, X_test, y_train, y_test, files_train, files_test = train_test_split(
+        X, y, df['file'].values[~np.isnan(df['label'].values)], test_size=0.2, random_state=42
+    )
+
+    # 6. Train model
+    if is_classification:
+        print("Training RandomForestClassifier...")
+        model = RandomForestClassifier(n_estimators=100, random_state=42)
+    else:
+        print("Training RandomForestRegressor...")
+        model = RandomForestRegressor(n_estimators=100, random_state=42)
+
+    model.fit(X_train, y_train)
+    joblib.dump(model, 'drowsiness_model.joblib')
+    print("Trained model saved as drowsiness_model.joblib")
+
+    # 7. Evaluate
+    y_pred = model.predict(X_test)
+    if is_classification:
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+    else:
+        mse = mean_squared_error(y_test, y_pred)
+        print(f"\nRegression Mean Squared Error: {mse:.3f}")
+
+    # 8. Save predictions
+    df_pred = pd.DataFrame({
+        'file': files_test,
+        'true_label': y_test,
+        'predicted': y_pred
+    })
+    df_pred.to_csv('eeg_predictions.csv', index=False)
+    print("Predictions for test set saved to eeg_predictions.csv.")
+
+    # 9. Feature importance
+    importances = model.feature_importances_
+    feature_names = [f'{band}_mean' for band in BANDS] + [f'{band}_std' for band in BANDS]
+    print("\nFeature importances:")
+    for name, imp in zip(feature_names, importances):
+        print(f"{name}: {imp:.3f}")
+
+    print("\nDone.")
+
+def predict_single_file(data_dir):
+    # Hide the main tkinter window
+    root = tk.Tk()
+    root.withdraw()
+
+    # Prompt user to select a .set file
+    file_path = filedialog.askopenfilename(
+        title="Select an EEGLAB .set file",
+        initialdir=data_dir,
+        filetypes=[("EEGLAB set files", "*.set"), ("All files", "*.*")]
+    )
+
+    if not file_path:
+        print("No file selected.")
+        return
+
+    print(f"Loading EEG data from: {file_path}")
+    try:
+        data, sfreq = read_eeg_data(file_path)
+        features = compute_band_features(data, sfreq)
+        print("Extracted features:")
+        for k, v in features.items():
+            print(f"{k}: {v:.3f}")
+    except Exception as e:
+        print(f"Error processing {file_path}: {e}")
+        return
+
+    # Load the trained model
+    model_path = 'drowsiness_model.joblib'
+    if not os.path.exists(model_path):
+        print(f"Trained model file '{model_path}' not found. Please train and save your model first.")
+        return
+
+    model = joblib.load(model_path)
+
+    # Prepare feature vector for prediction
+    X_new = np.array([[features[f'{band}_mean'] for band in BANDS] + [features[f'{band}_std'] for band in BANDS]])
+
+    # Predict drowsiness/sedation level
+    prediction = model.predict(X_new)[0]
+    print(f"\nPredicted drowsiness/sedation level: {prediction}")
+
+    # Explain why (feature importances)
+    if hasattr(model, 'feature_importances_'):
+        importances = model.feature_importances_
+        feature_names = [f'{band}_mean' for band in BANDS] + [f'{band}_std' for band in BANDS]
+        print("\nFeature importances (higher means more influence):")
+        for name, imp in sorted(zip(feature_names, importances), key=lambda x: -x[1]):
+            print(f"{name}: {imp:.3f}")
+        # Highlight the most influential band
+        most_important = feature_names[np.argmax(importances)]
+        print(f"\nThe most influential feature for this prediction was: {most_important}")
+
+def train_advanced_model(data_dir, use_sliding_windows=True, use_kmeans=False, use_synthetic_data=False):
+    """
+    Advanced training with multiple options:
+    - Sliding windows for more data points
+    - K-means clustering for unsupervised learning
+    - Synthetic data generation
+    - Hyperparameter tuning
+    """
+    
+    print("=== Advanced Model Training ===")
+    
+    # 1. Extract features (with or without sliding windows)
+    if use_sliding_windows:
+        print("Using sliding window approach...")
+        results, set_files = extract_window_features(data_dir, window_duration=30, overlap=0.5)
+    else:
+        print("Using full file approach...")
+        results, set_files = extract_file_features(data_dir)
+    
+    if not results:
+        print("No features extracted. Exiting.")
+        return
+    
+    df = pd.DataFrame(results)
+    print(f"Total data points: {len(df)}")
+    
+    # 2. Load labels
+    labels_path = os.path.join(data_dir, 'labels.csv')
+    if not os.path.exists(labels_path):
+        print("No labels.csv found. Cannot proceed with supervised learning.")
+        return
+    
+    labels_df = pd.read_csv(labels_path)
+    df = df.merge(labels_df, on='file', how='inner')
+    
+    if len(df) == 0:
+        print("No matching files between features and labels.")
+        return
+    
+    # 3. Generate synthetic data if requested
+    if use_synthetic_data:
+        print("Generating synthetic data...")
+        df = generate_synthetic_data(df)
+        print(f"After synthetic data generation: {len(df)} data points")
+    
+    # 4. Prepare features
+    feature_cols = [f'{band}_mean' for band in BANDS] + [f'{band}_std' for band in BANDS]
+    X = df[feature_cols].values
+    y = df['label'].values
+    
+    # Handle NaN values
+    if np.isnan(y).any():
+        valid_indices = ~np.isnan(y)
+        X = X[valid_indices]
+        y = y[valid_indices]
+        df = df.iloc[valid_indices].reset_index(drop=True)
+    
+    if len(y) == 0:
+        print("No valid labels found.")
+        return
+    
+    # 5. Scale features
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # 6. Train/test split
+    X_train, X_test, y_train, y_test, indices_train, indices_test = train_test_split(
+        X_scaled, y, range(len(y)), test_size=0.2, random_state=42, stratify=y
+    )
+    
+    # 7. K-means clustering (unsupervised)
+    if use_kmeans:
+        print("\n=== K-means Clustering ===")
+        kmeans = KMeans(n_clusters=4, random_state=42)
+        kmeans_labels = kmeans.fit_predict(X_scaled)
+        
+        # Evaluate clustering
+        print("K-means cluster distribution:")
+        unique, counts = np.unique(kmeans_labels, return_counts=True)
+        for cluster, count in zip(unique, counts):
+            print(f"Cluster {cluster}: {count} samples")
+        
+        # Compare with true labels
+        kmeans_accuracy = accuracy_score(y, kmeans_labels)
+        print(f"K-means clustering accuracy (vs true labels): {kmeans_accuracy:.3f}")
+    
+    # 8. Supervised learning with hyperparameter tuning
+    print("\n=== Supervised Learning with Hyperparameter Tuning ===")
+    
+    # Determine if classification or regression
+    is_classification = False
+    try:
+        y_int = y.astype(int)
+        if np.allclose(y, y_int):
+            y = y_int
+            is_classification = True
+    except:
+        pass
+    
+    if is_classification:
+        # Random Forest with Grid Search
+        rf = RandomForestClassifier(random_state=42)
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [None, 10, 20, 30],
+            'min_samples_split': [2, 5, 10],
+            'min_samples_leaf': [1, 2, 4]
+        }
+        
+        grid_search = GridSearchCV(rf, param_grid, cv=5, scoring='accuracy', n_jobs=-1)
+        grid_search.fit(X_train, y_train)
+        
+        best_model = grid_search.best_estimator_
+        best_score = grid_search.best_score_
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best cross-validation score: {best_score:.3f}")
+        
+        # Evaluate on test set
+        y_pred = best_model.predict(X_test)
+        test_accuracy = accuracy_score(y_test, y_pred)
+        print(f"Test accuracy: {test_accuracy:.3f}")
+        
+        print("\nClassification Report:")
+        print(classification_report(y_test, y_pred))
+        
+    else:
+        # Regression
+        rf = RandomForestRegressor(random_state=42)
+        param_grid = {
+            'n_estimators': [50, 100, 200],
+            'max_depth': [None, 10, 20, 30],
+            'min_samples_split': [2, 5, 10]
+        }
+        
+        grid_search = GridSearchCV(rf, param_grid, cv=5, scoring='neg_mean_squared_error', n_jobs=-1)
+        grid_search.fit(X_train, y_train)
+        
+        best_model = grid_search.best_estimator_
+        best_score = -grid_search.best_score_  # Convert back to MSE
+        
+        print(f"Best parameters: {grid_search.best_params_}")
+        print(f"Best cross-validation MSE: {best_score:.3f}")
+        
+        # Evaluate on test set
+        y_pred = best_model.predict(X_test)
+        test_mse = mean_squared_error(y_test, y_pred)
+        print(f"Test MSE: {test_mse:.3f}")
+    
+    # 9. Feature importance
+    importances = best_model.feature_importances_
+    feature_names = [f'{band}_mean' for band in BANDS] + [f'{band}_std' for band in BANDS]
+    
+    print("\nFeature importances:")
+    for name, imp in sorted(zip(feature_names, importances), key=lambda x: -x[1]):
+        print(f"{name}: {imp:.3f}")
+    
+    # 10. Save models and results
+    joblib.dump(best_model, 'advanced_drowsiness_model.joblib')
+    joblib.dump(scaler, 'feature_scaler.joblib')
+    
+    # Save predictions
+    df_pred = pd.DataFrame({
+        'file': df.iloc[indices_test]['file'].values,
+        'true_label': y_test,
+        'predicted': y_pred
+    })
+    df_pred.to_csv('advanced_predictions.csv', index=False)
+    
+    print("\nAdvanced model training complete!")
+    print("Models saved: advanced_drowsiness_model.joblib, feature_scaler.joblib")
+    print("Predictions saved: advanced_predictions.csv")
+
+def generate_synthetic_data(df, multiplier=2):
+    """
+    Generate synthetic data by adding noise to existing samples.
+    """
+    synthetic_data = []
+    
+    for _, row in df.iterrows():
+        # Original data
+        synthetic_data.append(row.to_dict())
+        
+        # Generate synthetic samples
+        for i in range(multiplier - 1):
+            synthetic_row = row.copy()
+            
+            # Add noise to feature values
+            for band in BANDS:
+                for stat in ['_mean', '_std']:
+                    col = f'{band}{stat}'
+                    if col in synthetic_row:
+                        # Add 5-15% random noise
+                        noise_factor = np.random.uniform(0.95, 1.05)
+                        synthetic_row[col] *= noise_factor
+            
+            synthetic_data.append(synthetic_row)
+    
+    return pd.DataFrame(synthetic_data)
+
+def extract_file_features(data_dir):
+    """Extract features from full files (original approach)"""
+    results = []
+    set_files = []
+    
+    for fname in os.listdir(data_dir):
+        if fname.endswith('.set'):
+            set_files.append(fname)
+            file_path = os.path.join(data_dir, fname)
+            print(f"Processing {fname}...")
+            
+            try:
+                data, sfreq = read_eeg_data(file_path)
+                features = compute_band_features(data, sfreq)
+                features['file'] = fname
+                results.append(features)
+            except Exception as e:
+                print(f"Error processing {fname}: {e}")
+    
+    return results, set_files
+
+def main():
+    print("Select an option:")
+    print("1. Train model on all files in the folder")
+    print("2. Predict drowsiness for a single .set file")
+    print("3. Train advanced model (sliding windows, K-means, hyperparameter tuning)")
+    choice = input("Enter 1, 2, or 3: ").strip()
+    
+    # Prompt user to select data folder
+    data_dir = select_data_folder()
+    if data_dir is None:
+        return
+    
+    if choice == '1':
+        train_model(data_dir)
+    elif choice == '2':
+        predict_single_file(data_dir)
+    elif choice == '3':
+        train_advanced_model(data_dir)
+    else:
+        print("Invalid choice. Exiting.")
+
+if __name__ == "__main__":
+    main() 
